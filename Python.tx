@@ -1,0 +1,694 @@
+import streamlit as st
+from snowflake.snowpark import Session
+import pandas as pd
+
+# Page configuration
+st.set_page_config(
+    page_title="Snowflake Metadata Mapping Tool",
+    page_icon="❄️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main {
+        padding: 2rem;
+    }
+    .stButton button {
+        width: 100%;
+        border-radius: 5px;
+        height: 3rem;
+        font-weight: bold;
+    }
+    .sql-box {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 5px;
+        font-family: monospace;
+        white-space: pre-wrap;
+        margin-top: 1rem;
+        border: 1px solid #dee2e6;
+    }
+    /* Add styles for target column display */
+    .target-column {
+        background-color: #f8f9fa;
+        padding: 0.5rem;
+        border-radius: 5px;
+        border: 1px solid #dee2e6;
+        display: block;
+        width: 100%;
+        margin: 0.25rem 0;
+        height: 3rem;
+        line-height: 1.4rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Create a shorthand reference to session state
+sst = st.session_state
+
+# Initialize session state for form data
+if 'db_list' not in sst:
+    sst.db_list = []
+if 'schema_list' not in sst:
+    sst.schema_list = []
+if 'table_list' not in sst:
+    sst.table_list = []
+if 'selected_db' not in sst:
+    sst.selected_db = None
+if 'selected_schema' not in sst:
+    sst.selected_schema = None
+if 'selected_table' not in sst:
+    sst.selected_table = None
+
+# Initialize session state for source selections
+if 'source_db_list' not in sst:
+    sst.source_db_list = []
+if 'source_schema_list' not in sst:
+    sst.source_schema_list = []
+if 'source_table_list' not in sst:
+    sst.source_table_list = []
+if 'selected_source_db' not in sst:
+    sst.selected_source_db = None
+if 'selected_source_schema' not in sst:
+    sst.selected_source_schema = None
+if 'selected_source_table' not in sst:
+    sst.selected_source_table = None
+
+# Initialize session state for joined sources and their columns
+if 'join_sources' not in sst:
+    sst.join_sources = []  # List to track all joined source tables
+if 'join_source_columns' not in sst:
+    sst.join_source_columns = {}  # Dictionary to store columns of joined sources
+if 'join_conditions' not in sst:
+    sst.join_conditions = {}  # Dictionary to store join conditions
+    
+# Flag to track if source table was added
+if 'source_table_added' not in sst:
+    sst.source_table_added = False
+
+# Initialize join_option from session state
+if 'current_join_selection' not in sst:
+    sst.current_join_selection = "No"
+
+# Main app header
+st.title("❄️ Snowflake Metadata Mapping Tool")
+st.markdown("Create and manage data transformation mappings")
+st.info("Target table: OUR_FIRST_DB.PUBLIC.MAPPING_META_DATA")
+
+# Function to fetch databases
+def fetch_databases():
+    try:
+        # Use Snowflake's implicit session
+        session = Session.builder.getOrCreate()
+        result = session.sql("""
+            SELECT DATABASE_NAME 
+            FROM INFORMATION_SCHEMA.DATABASES
+            ORDER BY DATABASE_NAME ASC
+        """).collect()
+        return [row["DATABASE_NAME"] for row in result]
+    except Exception as e:
+        st.error(f"Error fetching databases: {e}")
+        return []
+
+# Function to fetch schemas for a selected database
+def fetch_schemas(database):
+    try:
+        # Use Snowflake's implicit session
+        session = Session.builder.getOrCreate()
+        result = session.sql(f"""
+            SELECT SCHEMA_NAME 
+            FROM {database}.INFORMATION_SCHEMA.SCHEMATA
+            ORDER BY SCHEMA_NAME ASC
+        """).collect()
+        return [row["SCHEMA_NAME"] for row in result]
+    except Exception as e:
+        st.error(f"Error fetching schemas: {e}")
+        return []
+
+# Function to fetch tables for a selected database and schema
+def fetch_tables(database, schema):
+    try:
+        # Use Snowflake's implicit session
+        session = Session.builder.getOrCreate()
+        result = session.sql(f"""
+            SELECT TABLE_NAME 
+            FROM {database}.INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = '{schema}'
+            AND TABLE_TYPE = 'BASE TABLE'
+            ORDER BY TABLE_NAME ASC
+        """).collect()
+        return [row["TABLE_NAME"] for row in result]
+    except Exception as e:
+        st.error(f"Error fetching tables: {e}")
+        return []
+
+# Function to fetch table columns
+def fetch_table_columns(database, schema, table):
+    try:
+        session = Session.builder.getOrCreate()
+        result = session.sql(f"""
+            SELECT COLUMN_NAME 
+            FROM {database}.INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = '{schema}'
+            AND TABLE_NAME = '{table}'
+            ORDER BY ORDINAL_POSITION ASC
+        """).collect()
+        return [row["COLUMN_NAME"] for row in result]
+    except Exception as e:
+        st.error(f"Error fetching columns for {database}.{schema}.{table}: {e}")
+        return []
+
+# Function to handle database selection (target)
+def on_db_select():
+    if sst.selected_db:
+        with st.spinner("Fetching schemas..."):
+            sst.schema_list = fetch_schemas(sst.selected_db)
+        sst.selected_schema = None  # Reset selected schema
+        sst.table_list = []  # Reset table list
+        sst.selected_table = None  # Reset selected table
+        sst.source_table_added = False  # Reset source table added flag
+
+# Function to handle schema selection (target)
+def on_schema_select():
+    if sst.selected_schema and sst.selected_db:
+        with st.spinner("Fetching tables..."):
+            sst.table_list = fetch_tables(
+                sst.selected_db, 
+                sst.selected_schema
+            )
+        sst.selected_table = None  # Reset selected table
+        sst.source_table_added = False  # Reset source table added flag
+
+# Function to handle source database selection
+def on_source_db_select():
+    if sst.selected_source_db:
+        with st.spinner("Fetching source schemas..."):
+            sst.source_schema_list = fetch_schemas(sst.selected_source_db)
+        sst.selected_source_schema = None  # Reset selected source schema
+        sst.source_table_list = []  # Reset source table list
+        sst.selected_source_table = None  # Reset selected source table
+        sst.source_table_added = False  # Reset source table added flag
+
+# Function to handle source schema selection
+def on_source_schema_select():
+    if sst.selected_source_schema and sst.selected_source_db:
+        with st.spinner("Fetching source tables..."):
+            sst.source_table_list = fetch_tables(
+                sst.selected_source_db, 
+                sst.selected_source_schema
+            )
+        sst.selected_source_table = None  # Reset selected source table
+        sst.source_table_added = False  # Reset source table added flag
+
+# Initialize db_list if empty
+if not sst.db_list:
+    with st.spinner("Fetching databases..."):
+        sst.db_list = fetch_databases()
+        sst.source_db_list = sst.db_list  # Use the same list for source databases
+
+# Create columns for target selections
+col1, col2, col3 = st.columns(3)
+
+# Target selections
+with col1:
+    st.subheader("Select Target Database")
+    st.selectbox(
+        "Target Database",
+        options=sst.db_list if sst.db_list else ["No options to select."],
+        key="selected_db",
+        on_change=on_db_select,
+        index=0 if sst.selected_db is None else sst.db_list.index(sst.selected_db)
+    )
+
+with col2:
+    st.subheader("Select Target Schema")
+    st.selectbox(
+        "Target Schema",
+        options=sst.schema_list if sst.schema_list else ["No options to select."],
+        key="selected_schema",
+        on_change=on_schema_select,
+        index=0 if sst.selected_schema is None else sst.schema_list.index(sst.selected_schema)
+    )
+
+with col3:
+    st.subheader("Select Target Table")
+    st.selectbox(
+        "Target Table",
+        options=sst.table_list if sst.table_list else ["No options to select."],
+        key="selected_table",
+        index=0 if sst.selected_table is None else sst.table_list.index(sst.selected_table)
+    )
+
+# Show source selections only after target table is selected
+if sst.selected_table:
+    # Create a container for source selection
+    source_container = st.container()
+    with source_container:
+        st.markdown("---")
+        st.subheader("Source Table Selection")
+        source_cols = st.columns(3)
+        
+        with source_cols[0]:
+            st.selectbox(
+                "Source Database",
+                options=sst.source_db_list if sst.source_db_list else ["No options to select."],
+                key="selected_source_db",
+                on_change=on_source_db_select,
+                index=0 if sst.selected_source_db is None else sst.source_db_list.index(sst.selected_source_db)
+            )
+
+        with source_cols[1]:
+            st.selectbox(
+                "Source Schema",
+                options=sst.source_schema_list if sst.source_schema_list else ["No options to select."],
+                key="selected_source_schema",
+                on_change=on_source_schema_select,
+                index=0 if sst.selected_source_schema is None else sst.source_schema_list.index(sst.selected_source_schema)
+            )
+
+        with source_cols[2]:
+            st.selectbox(
+                "Source Table",
+                options=sst.source_table_list if sst.source_table_list else ["No options to select."],
+                key="selected_source_table",
+                index=0 if sst.selected_source_table is None else sst.source_table_list.index(sst.selected_source_table)
+            )
+
+    # Show message if source selections aren't made
+    #if not (sst.get('selected_source_db') and sst.get('selected_source_schema') and sst.get('selected_source_table')):
+        st.info("Please select a source database, schema, and table to continue")
+    
+    # Initialize join sources tracking
+    if 'join_sources' not in sst:
+        sst.join_sources = []  # List to track all joined source tables
+    
+    # Ask about joining after source table selection is complete
+    if (sst.selected_source_db and sst.selected_source_schema and sst.selected_source_table):
+        # Store the current source but don't add it to join_sources yet
+        current_source = f"{sst.selected_source_db}.{sst.selected_source_schema}.{sst.selected_source_table}"
+        
+        # Add main source table columns to the join_source_columns dictionary
+        if current_source not in sst.join_source_columns:
+            main_source_columns = fetch_table_columns(
+                sst.selected_source_db, 
+                sst.selected_source_schema, 
+                sst.selected_source_table
+            )
+            sst.join_source_columns[current_source] = main_source_columns
+            sst.source_columns = main_source_columns  # Store in session state for mapping
+        
+        # Show Join Additional Sources question immediately
+        st.markdown("---")
+        st.subheader("Join Additional Source Tables")
+        
+        col_join = st.columns(2)
+        with col_join[0]:
+            join_option = st.radio(
+                "Would you like to join another source table?",
+                options=["No", "Yes"],
+                key="current_join_selection"
+            )
+            
+        with col_join[1]:
+            if sst.join_sources:
+                st.write("Current joined sources:")
+                for idx, source in enumerate(sst.join_sources):
+                    st.write(f"{idx+1}. {source}")
+        
+        # If user wants to join another source table
+        if sst.current_join_selection == "Yes":
+            st.markdown("### Select Additional Source Table")
+            
+            # Initialize additional source variables if not exists
+            if 'additional_source_db' not in sst:
+                sst.additional_source_db = None
+            if 'additional_source_schema' not in sst:
+                sst.additional_source_schema = None
+            if 'additional_source_table' not in sst:
+                sst.additional_source_table = None
+                
+            # Functions for additional source selection
+            def on_additional_db_select():
+                if sst.additional_source_db:
+                    with st.spinner("Fetching schemas..."):
+                        sst.additional_source_schema_list = fetch_schemas(sst.additional_source_db)
+                    sst.additional_source_schema = None
+                    sst.additional_source_table_list = []
+                    sst.additional_source_table = None
+
+            def on_additional_schema_select():
+                if sst.additional_source_schema and sst.additional_source_db:
+                    with st.spinner("Fetching tables..."):
+                        sst.additional_source_table_list = fetch_tables(
+                            sst.additional_source_db, 
+                            sst.additional_source_schema
+                        )
+                    sst.additional_source_table = None
+                
+            # Initialize lists for additional source
+            if 'additional_source_schema_list' not in sst:
+                sst.additional_source_schema_list = []
+            if 'additional_source_table_list' not in sst:
+                sst.additional_source_table_list = []
+                
+            # Display selection UI for additional source
+            add_source_cols = st.columns(3)
+            
+            with add_source_cols[0]:
+                st.selectbox(
+                    "Additional Source Database",
+                    options=sst.db_list if sst.db_list else ["No options to select."],
+                    key="additional_source_db",
+                    on_change=on_additional_db_select,
+                    index=0 if sst.additional_source_db is None else sst.db_list.index(sst.additional_source_db)
+                )
+
+            with add_source_cols[1]:
+                st.selectbox(
+                    "Additional Source Schema",
+                    options=sst.additional_source_schema_list if sst.additional_source_schema_list else ["No options to select."],
+                    key="additional_source_schema",
+                    on_change=on_additional_schema_select,
+                    index=0 if sst.additional_source_schema is None else sst.additional_source_schema_list.index(sst.additional_source_schema)
+                )
+
+            with add_source_cols[2]:
+                st.selectbox(
+                    "Additional Source Table",
+                    options=sst.additional_source_table_list if sst.additional_source_table_list else ["No options to select."],
+                    key="additional_source_table",
+                    index=0 if sst.additional_source_table is None else sst.additional_source_table_list.index(sst.additional_source_table)
+                )
+                
+            # Process the selections if all are selected
+            if (sst.additional_source_db and sst.additional_source_schema and sst.additional_source_table):
+                
+                additional_source = f"{sst.additional_source_db}.{sst.additional_source_schema}.{sst.additional_source_table}"
+                
+                # Define Join Condition before Add This Source Table button
+                st.markdown("### Define Join Condition")
+                
+                # Fetch target columns for the dropdown
+                target_columns = fetch_table_columns(
+                    sst.selected_db, 
+                    sst.selected_schema, 
+                    sst.selected_table
+                )
+                
+                # Fetch source columns for the dropdown
+                additional_source_columns = fetch_table_columns(
+                    sst.additional_source_db, 
+                    sst.additional_source_schema, 
+                    sst.additional_source_table
+                )
+                
+                # Initialize in session state if not exists
+                if additional_source not in sst.join_source_columns:
+                    sst.join_source_columns[additional_source] = additional_source_columns
+                
+                if additional_source not in sst.join_conditions:
+                    sst.join_conditions[additional_source] = {
+                        'target_columns': [],
+                        'source_columns': []
+                    }
+                
+                # Create two columns for the dropdowns
+                join_col1, join_col2 = st.columns(2)
+                
+                with join_col1:
+                    st.write("**Select Target Columns**")
+                    selected_target_columns = st.multiselect(
+                        "Target Columns",
+                        options=target_columns,
+                        default=sst.join_conditions[additional_source]['target_columns'],
+                        key=f"target_columns_{additional_source}"
+                    )
+                
+                with join_col2:
+                    st.write("**Select Source Columns**")
+                    selected_source_columns = st.multiselect(
+                        "Source Columns",
+                        options=additional_source_columns,
+                        default=sst.join_conditions[additional_source]['source_columns'],
+                        key=f"source_columns_{additional_source}"
+                    )
+                
+                # Update join conditions in session state
+                if selected_target_columns and selected_source_columns:
+                    sst.join_conditions[additional_source]['target_columns'] = selected_target_columns
+                    sst.join_conditions[additional_source]['source_columns'] = selected_source_columns
+                
+                # Display the selected join condition
+                if sst.join_conditions[additional_source]['target_columns'] and sst.join_conditions[additional_source]['source_columns']:
+                    st.write("**Selected Join Condition:**")
+                    for target_col, source_col in zip(
+                        sst.join_conditions[additional_source]['target_columns'],
+                        sst.join_conditions[additional_source]['source_columns']
+                    ):
+                        st.write(f"`{target_col}` = `{source_col}`")
+                
+                # Add button to confirm additional source
+                if st.button("Add This Source Table"):
+                    if additional_source not in sst.join_sources:
+                        # Validate that join conditions are defined
+                        if (not sst.join_conditions[additional_source]['target_columns'] or 
+                            not sst.join_conditions[additional_source]['source_columns']):
+                            st.warning("Please define join conditions before adding the source table.")
+                        else:
+                            sst.join_sources.append(additional_source)
+                            st.success(f"Added {additional_source} to joined sources!")
+                            sst.source_table_added = True
+                            # Force a rerun to update the UI
+                            st.rerun()
+                    else:
+                        st.warning(f"Source {additional_source} is already in the joined sources list.")
+        else:
+            # If user doesn't want to join, show "Continue to Column Mapping" button
+            if st.button("Continue to Column Mapping"):
+                sst.source_table_added = True
+                st.rerun()
+
+    # Show mapping options after source table is added
+    if sst.source_table_added:
+        st.markdown("---")
+        st.subheader("Column Mapping")
+        
+        # Fetch target columns if not already fetched
+        if 'target_columns' not in sst:
+            sst.target_columns = fetch_table_columns(
+                sst.selected_db, 
+                sst.selected_schema, 
+                sst.selected_table
+            )
+        
+        # Create a dictionary to track which table each source column belongs to
+        all_source_columns = []
+        source_column_to_table = {}  # New dictionary to track which table each column comes from
+        
+        # Get the main source table
+        main_source = f"{sst.selected_source_db}.{sst.selected_source_schema}.{sst.selected_source_table}"
+        
+        # First, add columns from the main source table
+        for column in sst.join_source_columns[main_source]:
+            all_source_columns.append(column)
+            source_column_to_table[column] = sst.selected_source_table
+        
+        # Then add columns from joined tables
+        for source in sst.join_sources:
+            table_name = source.split('.')[-1]
+            for column in sst.join_source_columns[source]:
+                # If column name already exists, append the table name to make it unique
+                if column in all_source_columns:
+                    column_with_table = f"{column}_{table_name}"
+                    all_source_columns.append(column_with_table)
+                    source_column_to_table[column_with_table] = table_name
+                    # Store the original column name for mapping
+                    source_column_to_table[f"_original_{column_with_table}"] = column
+                else:
+                    all_source_columns.append(column)
+                    source_column_to_table[column] = table_name
+        
+        # Initialize mapping and transformation dictionaries if not exists
+        if 'column_mapping' not in sst:
+            sst.column_mapping = {}
+            # Pre-map columns with matching names - but only from the main table
+            for tcol in sst.target_columns:
+                if tcol in sst.join_source_columns[main_source]:
+                    sst.column_mapping[tcol] = tcol
+        
+        if 'transformations' not in sst:
+            sst.transformations = {}
+        
+        # Create mapping interface
+        st.write("Map each target column to a source column and specify any transformations:")
+        
+        # Create three columns for the mapping interface
+        mapping_cols = st.columns([1, 1, 2])
+        
+        with mapping_cols[0]:
+            st.write("**Target Column**")
+            for tcol in sst.target_columns:
+                # Use HTML to create a fixed-width element that looks similar to the dropdowns
+                st.markdown(f'<div class="target-column">{tcol}</div>', unsafe_allow_html=True)
+        
+        with mapping_cols[1]:
+            st.write("**Source Column**")
+            # For each target column, create a dropdown to select a source column
+            for i, tcol in enumerate(sst.target_columns):
+                # Generate a unique key for each selectbox
+                key = f"mapping_{tcol}_{i}"
+                
+                # Create source options with table names
+                source_options = ["None"]
+                for column in all_source_columns:
+                    table_name = source_column_to_table[column]
+                    # Check if this is a renamed column due to duplicates
+                    if column.startswith(f"{tcol}_"):
+                        # This is potentially an exact match but from a joined table
+                        source_options.append(f"{column} ({table_name})")
+                    else:
+                        source_options.append(f"{column} ({table_name})")
+                
+                # Set default value to previously mapped column if exists
+                default_idx = 0
+                if tcol in sst.column_mapping:
+                    mapped_col = sst.column_mapping[tcol]
+                    # Find the index of the mapped column in the options
+                    for idx, option in enumerate(source_options):
+                        if option.startswith(f"{mapped_col} ("):
+                            default_idx = idx
+                            break
+                
+                # Create selectbox for mapping
+                selected_source_option = st.selectbox(
+                    f"Map to {tcol}",
+                    options=source_options,
+                    index=default_idx,
+                    key=key,
+                    label_visibility="collapsed"
+                )
+                
+                # Update mapping in session state
+                if selected_source_option != "None":
+                    # Extract just the column name from the option (remove the table name in parentheses)
+                    selected_source = selected_source_option.split(" (")[0]
+                    
+                    # Check if this is a column with a table suffix due to duplicates
+                    if "_original_" + selected_source in source_column_to_table:
+                        # Use the original column name for mapping
+                        original_column = source_column_to_table["_original_" + selected_source]
+                        sst.column_mapping[tcol] = original_column
+                    else:
+                        sst.column_mapping[tcol] = selected_source
+                elif tcol in sst.column_mapping:
+                    del sst.column_mapping[tcol]
+        
+        with mapping_cols[2]:
+            st.write("**Transformation (SQL)**")
+            # For each target column, create a text field for transformation
+            for i, tcol in enumerate(sst.target_columns):
+                # Generate a unique key for each text input
+                key = f"transform_{tcol}_{i}"
+                
+                # Get previous transformation if it exists
+                previous_transform = sst.transformations.get(tcol, "")
+                
+                # Create text input for transformation
+                transformation = st.text_input(
+                    f"Transformation for {tcol}",
+                    value=previous_transform,
+                    key=key,
+                    placeholder="e.g., UPPER(col1) or col1 || ' ' || col2",
+                    label_visibility="collapsed"
+                )
+                
+                # Update transformation in session state
+                if transformation:
+                    sst.transformations[tcol] = transformation
+                elif tcol in sst.transformations:
+                    del sst.transformations[tcol]
+        
+        # Flag to track if mapping was saved
+        if 'mapping_saved' not in sst:
+            sst.mapping_saved = False
+            
+        # Show save button for mappings
+        if st.button("Save Mapping"):
+            sst.mapping_saved = True
+            st.success("Column mapping and transformations saved successfully!")
+            # You can add code here to store the mappings in Snowflake if needed
+
+        # Display the table with target and source details
+        st.markdown("---")
+        st.subheader("Table Details")
+
+        # Prepare data for display based on mapping status
+        if sst.mapping_saved:
+            # When mapping is saved, show only the mapped columns
+            mapped_target_cols = []
+            mapped_source_cols = []
+            source_tables = []
+            transformations = []
+            
+            for tcol in sst.target_columns:
+                if tcol in sst.column_mapping:
+                    source_col = sst.column_mapping[tcol]
+                    transform = sst.transformations.get(tcol, "")
+                    
+                    # Determine which source table this column comes from
+                    table_found = False
+                    for source, columns in sst.join_source_columns.items():
+                        if source_col in columns:
+                            table_name = source.split(".")[-1]
+                            source_tables.append(table_name)
+                            table_found = True
+                            break
+                    
+                    if not table_found:
+                        source_tables.append("Unknown")
+                        
+                    mapped_target_cols.append(tcol)
+                    mapped_source_cols.append(source_col)
+                    transformations.append(transform)
+            
+            # Number of rows in the result table
+            result_length = len(mapped_target_cols)
+            
+            # Create a table with the mapped columns
+            table_data = {
+                "Target Table": [f"{sst.selected_db}.{sst.selected_schema}.{sst.selected_table}" for _ in range(result_length)],
+                "Source Table": [source_tables[i] for i in range(result_length)],
+                "Target Column": mapped_target_cols,
+                "Source Column": mapped_source_cols
+            }
+            
+            # Add transformation column if any transformations exist
+            if any(transformations):
+                table_data["Transformation"] = transformations
+        else:
+            # If mapping not saved, show all columns
+            max_length = max(len(sst.target_columns), len(all_source_columns))
+            target_columns_padded = sst.target_columns + [""] * (max_length - len(sst.target_columns))
+            source_columns_padded = all_source_columns + [""] * (max_length - len(all_source_columns))
+            source_tables_padded = [source_column_to_table.get(col, "") for col in source_columns_padded]
+
+            # Create a table to display the details
+            table_data = {
+                "Target Table": [f"{sst.selected_db}.{sst.selected_schema}.{sst.selected_table}" for _ in range(max_length)],
+                "Source Table": source_tables_padded,
+                "Target Column": target_columns_padded,
+                "Source Column": source_columns_padded
+            }
+
+        # Convert the dictionary to a DataFrame for better display
+        df = pd.DataFrame(table_data)
+
+        # Display the table
+        st.table(df)
+
+# Footer
+st.markdown("---")
+st.markdown("© 2023 Snowflake Metadata Mapping Tool")
